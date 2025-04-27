@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/select.h>
+#include <time.h> 
 
 #include "srtp.h"
 #include "srtp-packet.h"
@@ -17,6 +18,7 @@
 #include "byteorder64.h"
 #include "d_print.h"
 
+int g_drop_rate_percent = 0;
 extern Srtp_Pcb_t G_pcb; /* in srtp-pcb.c */
 
 /* CS3201 Coursework P2: Simpler Reliable Transport Protocol (SRTP) */
@@ -38,6 +40,15 @@ const char* srtp_state_to_string(SRTP_state_t state) {
 /* Initialization of SRTP - called at the beginning */
 void srtp_initialise() {
     reset_SrtpPcb();
+    srandom(time(NULL) ^ getpid());
+}
+int packet_drop() {
+    if (g_drop_rate_percent <= 0) return 0; // no drop if disabled
+
+    if ((random() % 100) < g_drop_rate_percent)
+        return 1; // drop the packet
+    else
+        return 0; // send normally
 }
 
 /* Server side - Start listening on the given port */
@@ -242,6 +253,7 @@ int srtp_tx(int sd, void *data, uint16_t data_size) {
     memset(&packet, 0, sizeof(packet));
 
     // Fill the packet
+    //uint32_t my_seq = G_pcb.seq_tx + 1;
     G_pcb.seq_tx++;
     packet.header.packet_type = SRTP_TYPE_data_req;
     packet.header.seq_num = G_pcb.seq_tx;
@@ -269,6 +281,12 @@ int srtp_tx(int sd, void *data, uint16_t data_size) {
     int attempts = 0;
 
     while (attempts < SRTP_MAX_RE_TX) {
+        uint64_t start = srtp_timestamp();
+        if (packet_drop()) {
+            printf("[DROP] Simulating outgoing packet loss!\n");
+            attempts++;
+            continue; // Pretend it was dropped
+        }
 
         ssize_t sent = sendto(sd, &packet, sizeof(Srtp_Header_t)+data_size, 0,
         (struct sockaddr*)&G_pcb.remote, sizeof(G_pcb.remote));
@@ -299,18 +317,22 @@ int srtp_tx(int sd, void *data, uint16_t data_size) {
             printf("Unexpected packet type 0x%x\n", ack_packet.header.packet_type);
             return SRTP_ERROR_protocol;
         }
+        
 
         if (ack_packet.header.ack_num != packet.header.seq_num) {
            printf("Data ack mismatch! Expected ack_num=%u, got ack_num=%u\n",
-                   ack_packet.header.seq_num, packet.header.ack_num);
+                   ack_packet.header.ack_num, packet.header.seq_num);
           return SRTP_ERROR_data;
         }
 
         printf("Received valid data_ack for seq=%u!\n", G_pcb.seq_tx);
+        uint64_t end = srtp_timestamp();
 
         
-        
+      
         G_pcb.state = SRTP_state_connected;
+        G_pcb.data_req_bytes_tx = G_pcb.data_req_bytes_tx + packet.header.payload_len;
+        G_pcb.rtt = end - start;
 
         return data_size; // SUCCESS
     }
@@ -341,7 +363,8 @@ int srtp_rx(int sd, void *data, uint16_t data_size) {
         perror("recv");
         return SRTP_ERROR;
     }
-    G_pcb.seq_rx++;
+
+   
 
     // Check if the packet is a data_req
     if (packet.header.packet_type != SRTP_TYPE_data_req) {
@@ -356,6 +379,7 @@ int srtp_rx(int sd, void *data, uint16_t data_size) {
         printf("Error: Payload length %u exceeds buffer size %u\n", packet.header.payload_len, data_size);
         return SRTP_ERROR_data;
     }
+     G_pcb.seq_rx++;
 
     // Copy payload into the user's buffer
     memcpy(data, packet.payload, packet.header.payload_len);
@@ -385,7 +409,7 @@ int srtp_rx(int sd, void *data, uint16_t data_size) {
     G_pcb.state = SRTP_state_connected;
 
 
-
+    G_pcb.data_req_bytes_rx = G_pcb.data_req_bytes_rx + packet.header.payload_len;
     return packet.header.payload_len; // Success: number of bytes received
 }
 
