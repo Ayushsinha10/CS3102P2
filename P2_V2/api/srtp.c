@@ -19,6 +19,7 @@
 #include "d_print.h"
 
 int g_drop_rate_percent = 0;
+static int adaptive_rto_enabled = 1;
 extern Srtp_Pcb_t G_pcb; /* in srtp-pcb.c */
 
 /* CS3201 Coursework P2: Simpler Reliable Transport Protocol (SRTP) */
@@ -241,265 +242,255 @@ int srtp_open(const char *fqdn, uint16_t port) {
 
 
 int srtp_tx(int sd, void *data, uint16_t data_size) {
-    if (G_pcb.state != SRTP_state_connected) {
-        printf(srtp_state_to_string(G_pcb.state));
-        return SRTP_ERROR_api;
-    }
-    if(G_pcb.state == SRTP_state_error){
-        return SRTP_ERROR_fsm;
-    }
+    if (G_pcb.state != SRTP_state_connected)     return SRTP_ERROR_api;
+    if (data_size > SRTP_MAX_PAYLOAD_SIZE)       return SRTP_ERROR_data;
 
-    Srtp_Packet_t packet;
-    memset(&packet, 0, sizeof(packet));
-
-    // Fill the packet
-    //uint32_t my_seq = G_pcb.seq_tx + 1;
-    G_pcb.seq_tx++;
-    packet.header.packet_type = SRTP_TYPE_data_req;
-    packet.header.seq_num = G_pcb.seq_tx;
-    packet.header.ack_num = G_pcb.seq_rx;
-    packet.header.payload_len = data_size;
-    packet.header.checksum = 0;
-
-    if (data_size > SRTP_MAX_PAYLOAD_SIZE) {
-        printf("Error: Payload size too big\n");
-        return SRTP_ERROR_data;
+    // give send() calls a 500ms recv‐timeout so we can retry
+    struct timeval tv = { 0, SRTP_RTO_FIXED };
+    if(!adaptive_rto_enabled){
+    setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     }
 
-    memcpy(packet.payload, data, data_size);
+    // our “next” sequence is old seq_tx + 1, modulo 2^16
+    uint16_t seq = (uint16_t)(G_pcb.seq_tx + 1);
+    uint64_t start = srtp_timestamp();
+    static uint64_t rtt_estimated = 0;
+    static uint64_t rtt_dev = 0;
 
-    // Set socket receive timeout
-    struct timeval timeout;
-    timeout.tv_sec = 0;
-    timeout.tv_usec = SRTP_RTO_FIXED;  // 0.5 seconds
+    for (int attempt = 0; attempt < SRTP_MAX_RE_TX; ++attempt) {
+        // build the packet
+        Srtp_Packet_t pkt;
+        memset(&pkt,0,sizeof(pkt));
+        pkt.header.packet_type = SRTP_TYPE_data_req;
+        pkt.header.seq_num      = seq;
+        pkt.header.ack_num      = (uint16_t)G_pcb.seq_rx;
+        pkt.header.payload_len  = data_size;
+        pkt.header.checksum     = 0;               // optional
+        memcpy(pkt.payload, data, data_size);
 
-    if (setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
-        perror("setsockopt");
-        return SRTP_ERROR;
-    }
-
-    int attempts = 0;
-
-    while (attempts < SRTP_MAX_RE_TX) {
-        uint64_t start = srtp_timestamp();
+        // simulate loss
         if (packet_drop()) {
-            printf("[DROP] Simulating outgoing packet loss!\n");
-            attempts++;
-            continue; // Pretend it was dropped
+            printf("[DROP] data_req(seq=%u)\n", seq);
+        } else {
+            
+            sendto(sd, &pkt,
+                   sizeof(Srtp_Header_t) + data_size,
+                   0,
+                  (struct sockaddr*)&G_pcb.remote,
+                  sizeof(G_pcb.remote));
         }
 
-        ssize_t sent = sendto(sd, &packet, sizeof(Srtp_Header_t)+data_size, 0,
-        (struct sockaddr*)&G_pcb.remote, sizeof(G_pcb.remote));
-        if (sent < 0) {
-            perror("send");
+        // wait for an ACK
+        Srtp_Packet_t ack;
+        ssize_t n = recv(sd, &ack, sizeof(ack), 0);
+        if (n < 0) {
+            // timeout or other recv error
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                printf("timeout, retransmitting seq=%u\n", seq);
+                continue;
+            }
+            perror("recv");
             return SRTP_ERROR;
         }
 
-        printf("Sent data_req (seq=%u), waiting for data_ack...\n", packet.header.seq_num);
-
-        // Now wait for data_ack
-        Srtp_Packet_t ack_packet;
-        memset(&ack_packet, 0, sizeof(ack_packet));
-
-        ssize_t n = recv(sd, &ack_packet, sizeof(ack_packet), 0);
-        if (n < 0) {
-            if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                printf("Timeout waiting for data_ack, retransmitting...\n");
-                attempts++;
-                continue; // Retry
-            } else {
-                perror("recv");
-                return SRTP_ERROR;
-            }
+        // only DATA_ACK with matching ack_num lets us advance
+        if (ack.header.packet_type  != SRTP_TYPE_data_ack ||
+            ack.header.ack_num       != seq)
+        {
+            printf("got pkt type=0x%x ack_num=%u (want %u), retrying\n",
+                   ack.header.packet_type,
+                   ack.header.ack_num,
+                   seq);
+            continue;
         }
 
-        if (ack_packet.header.packet_type != SRTP_TYPE_data_ack) {
-            printf("Unexpected packet type 0x%x\n", ack_packet.header.packet_type);
-            return SRTP_ERROR_protocol;
-        }
-        
-
-        if (ack_packet.header.ack_num != packet.header.seq_num) {
-           printf("Data ack mismatch! Expected ack_num=%u, got ack_num=%u\n",
-                   ack_packet.header.ack_num, packet.header.seq_num);
-          return SRTP_ERROR_data;
-        }
-
-        printf("Received valid data_ack for seq=%u!\n", G_pcb.seq_tx);
+        // success!
         uint64_t end = srtp_timestamp();
+        G_pcb.seq_tx = seq;
+        G_pcb.data_req_bytes_tx += data_size;
+        G_pcb.rtt = end - start;   /* your start timestamp if you stored it */
+        if(adaptive_rto_enabled){
+        uint64_t rtt = G_pcb.rtt;
+        uint64_t rtt_diff = (rtt > rtt_estimated) ? (rtt - rtt_estimated) : (rtt_estimated - rtt);
+        rtt_estimated = (rtt_estimated * 7 + rtt) / 8;
+        rtt_dev = (rtt_dev * 7 + rtt_diff) / 8;
 
-        
-      
-        G_pcb.state = SRTP_state_connected;
-        G_pcb.data_req_bytes_tx = G_pcb.data_req_bytes_tx + packet.header.payload_len;
-        G_pcb.rtt = end - start;
+        uint64_t adaptive_rto = rtt_estimated + 4 * rtt_dev;
 
-        return data_size; // SUCCESS
+        // If adaptive RTO is greater than 0, use it; otherwise, use the fixed RTO
+        if (adaptive_rto > 0) {
+            tv.tv_usec = adaptive_rto;  // Set adaptive timeout based on RTT
+        } else {
+            tv.tv_usec = SRTP_RTO_FIXED;  // Use fixed timeout if adaptive RTO is 0
+        }
+
+        setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        }
+        return data_size;
     }
 
-    printf("Failed to get data_ack after %d attempts\n", SRTP_MAX_RE_TX);
-    return SRTP_ERROR_data; // Failure after retries
+    // out of retries
+    printf("srtp_tx: giving up on seq=%u\n", seq);
+    G_pcb.state = SRTP_state_error;
+
+    // Close the socket immediately
+    if (close(sd) < 0) {
+        perror("Failed to close socket");
+        return SRTP_ERROR;
+    }
+
+    printf("Connection forcefully closed. State set to SRTP_state_error.\n");
+    return SRTP_ERROR_data;
 }
-
-
-/* Receive data over UDP (synchronous) */
 
 int srtp_rx(int sd, void *data, uint16_t data_size) {
-    if (G_pcb.state != SRTP_state_connected) {
-        printf("Error: Cannot receive, not in connected state.\n");
-       return SRTP_ERROR_api;
+    if (G_pcb.state != SRTP_state_connected)   return SRTP_ERROR_api;
+    struct timeval timeout;
+    timeout.tv_sec = 1;  // Wait for 2 seconds
+    timeout.tv_usec = 500000; // No microsecond precision
+
+    while (1) {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(sd, &read_fds);
+        int select_result = select(sd + 1, &read_fds, NULL, NULL, &timeout);
+        if (select_result == 0) {
+            // Timeout has occurred, no data received within 2 seconds
+            printf("Timeout waiting for data, closing connection...\n");
+            G_pcb.state = SRTP_state_error;
+
+            // Close the socket immediately
+            if (close(sd) < 0) {
+                perror("Failed to close socket");
+                return SRTP_ERROR;
+            }
+        
+            printf("Connection forcefully closed. State set to SRTP_state_error.\n");
+            return SRTP_ERROR_data;
+        }
+
+        if (select_result < 0) {
+            perror("select error");
+            return SRTP_ERROR;
+        }
+        Srtp_Packet_t pkt;
+        ssize_t n = recv(sd, &pkt, sizeof(pkt), 0);
+        if (n < 0) {
+            perror("recv");
+            return SRTP_ERROR;
+        }
+
+        if (pkt.header.packet_type != SRTP_TYPE_data_req)
+            continue;  // ignore anything else
+
+        uint16_t expected = (uint16_t)(G_pcb.seq_rx + 1);
+
+        if (pkt.header.seq_num == expected) {
+            // — in‐order packet —
+            if (pkt.header.payload_len > data_size)
+                return SRTP_ERROR_data;
+            memcpy(data, pkt.payload, pkt.header.payload_len);
+            G_pcb.seq_rx = expected;
+            G_pcb.data_req_bytes_rx += pkt.header.payload_len;
+
+            // send ACK for this new packet
+            Srtp_Packet_t ack = {0};
+            ack.header.packet_type = SRTP_TYPE_data_ack;
+            ack.header.seq_num     = expected;
+            ack.header.ack_num     = expected;
+            sendto(sd, &ack, sizeof(Srtp_Header_t), 0,
+                   (struct sockaddr*)&G_pcb.remote, sizeof(G_pcb.remote));
+
+            return pkt.header.payload_len;
+        }
+        else if ((int16_t)(pkt.header.seq_num - expected) < 0) {
+            // — duplicate (seq_num ≤ seq_rx) —
+            // re-ACK the last in‐order packet so the sender can recover
+            Srtp_Packet_t dup_ack = {0};
+            dup_ack.header.packet_type = SRTP_TYPE_data_ack;
+            dup_ack.header.seq_num     = G_pcb.seq_rx;
+            dup_ack.header.ack_num     = G_pcb.seq_rx;
+            sendto(sd, &dup_ack, sizeof(Srtp_Header_t), 0,
+                   (struct sockaddr*)&G_pcb.remote, sizeof(G_pcb.remote));
+            // and keep waiting for the real next packet
+            continue;
+        }
+        else {
+            // pkt.seq_num > expected (a future packet) — just drop it
+            continue;
+        }
     }
-    if(G_pcb.state == SRTP_state_error){
-        return SRTP_ERROR_fsm;
-    }
-
-
-    Srtp_Packet_t packet;
-    memset(&packet, 0, sizeof(packet));
-
-    // Wait and receive incoming packet
-    ssize_t n = recv(sd, &packet, sizeof(packet), 0);
-    if (n < 0) {
-        perror("recv");
-        return SRTP_ERROR;
-    }
-
-   
-
-    // Check if the packet is a data_req
-    if (packet.header.packet_type != SRTP_TYPE_data_req) {
-        printf("Error: Unexpected packet type 0x%x (expected data_req)\n", packet.header.packet_type);
-      //  return SRTP_ERROR_api;
-    }
-
-    printf("Received data_req with seq_num=%u\n", packet.header.seq_num);
-
-    // Check payload length
-    if (packet.header.payload_len > data_size) {
-        printf("Error: Payload length %u exceeds buffer size %u\n", packet.header.payload_len, data_size);
-        return SRTP_ERROR_data;
-    }
-     G_pcb.seq_rx++;
-
-    // Copy payload into the user's buffer
-    memcpy(data, packet.payload, packet.header.payload_len);
-
-    // Now build a data_ack packet
-    Srtp_Packet_t ack_packet;
-    memset(&ack_packet, 0, sizeof(ack_packet));
-
-    ack_packet.header.packet_type = SRTP_TYPE_data_ack;
-    ack_packet.header.seq_num = G_pcb.seq_tx;
-    ack_packet.header.ack_num = G_pcb.seq_rx;
-    ack_packet.header.payload_len = 0;
-    ack_packet.header.checksum = 0; // Optional checksum
-
-   // struct sockaddr_in client_addr;
-  //  socklen_t addrlen = sizeof(client_addr);
-
-    // Send data_ack back
-    ssize_t sent =  sendto(sd, &ack_packet, sizeof(Srtp_Header_t), 0,
-    (struct sockaddr*)&G_pcb.remote, sizeof(G_pcb.remote));
-    if (sent < 0) {
-        perror("send");
-        return SRTP_ERROR;
-    }
-
-    printf("Sent data_ack for seq_num=%u\n", packet.header.seq_num);
-    G_pcb.state = SRTP_state_connected;
-
-
-    G_pcb.data_req_bytes_rx = G_pcb.data_req_bytes_rx + packet.header.payload_len;
-    return packet.header.payload_len; // Success: number of bytes received
 }
 
+
 int srtp_close(int sd) {
+    // only allowed in CONNECTED
     if (G_pcb.state != SRTP_state_connected) {
         printf("Error: srtp_close() can only be called in CONNECTED state.\n");
         return SRTP_ERROR_api;
     }
-    if(G_pcb.state == SRTP_state_error){
-        return SRTP_ERROR_fsm;
+
+    // 1) turn off any recv‐timeout so we block indefinitely in the close handshake
+    struct timeval tv = { 0, 0 };
+    if (setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        perror("setsockopt");
+        // not fatal, but beware it might still time out
     }
 
-
-    // 1. Send close_req
-    Srtp_Packet_t close_req;
-    memset(&close_req, 0, sizeof(close_req));
-    close_req.header.packet_type = SRTP_TYPE_close_req;
-    close_req.header.seq_num = G_pcb.seq_tx;
-    close_req.header.ack_num = G_pcb.seq_rx;
-    close_req.header.payload_len = 0;
-    close_req.header.checksum = 0;
-
-    if (sendto(sd, &close_req, sizeof(Srtp_Header_t), 0,
-               (struct sockaddr*)&G_pcb.remote, sizeof(G_pcb.remote)) < 0) {
-        perror("sendto close_req");
-        return SRTP_ERROR;
-    }
-
+    // 2) send our close_req
+    Srtp_Packet_t pkt = {0};
+    pkt.header.packet_type = SRTP_TYPE_close_req;
+    pkt.header.seq_num     = (uint16_t)G_pcb.seq_tx;
+    pkt.header.ack_num     = (uint16_t)G_pcb.seq_rx;
+    sendto(sd, &pkt, sizeof(Srtp_Header_t), 0,
+           (struct sockaddr*)&G_pcb.remote, sizeof(G_pcb.remote));
     printf("[SRTP] Sent close_req.\n");
 
-    // 2. Transition state to closing_i
+    // 3) transition
     G_pcb.state = handle_state_transition(G_pcb.state, SRTP_TYPE_close_req);
 
-    // 3. Wait for close_ack
-    Srtp_Packet_t recv_packet;
-    memset(&recv_packet, 0, sizeof(recv_packet));
+    // 4) now loop until we reach CLOSED
+    while (G_pcb.state != SRTP_state_closed) {
+        Srtp_Packet_t in = {0};
+        ssize_t n = recv(sd, &in, sizeof(in), 0);
+        if (n < 0) {
+            perror("recv in close");
+            return SRTP_ERROR;
+        }
 
-    ssize_t n = recv(sd, &recv_packet, sizeof(recv_packet), 0);
-    if (n < 0) {
-        perror("recv close_ack");
-        return SRTP_ERROR;
+        switch (in.header.packet_type) {
+          case SRTP_TYPE_close_req:
+            // peer also wants to close → reply with close_ack
+            {
+              Srtp_Packet_t ack = {0};
+              ack.header.packet_type = SRTP_TYPE_close_ack;
+              ack.header.seq_num     = (uint16_t)G_pcb.seq_tx;
+              ack.header.ack_num     = (uint16_t)G_pcb.seq_rx;
+              sendto(sd, &ack, sizeof(Srtp_Header_t), 0,
+                     (struct sockaddr*)&G_pcb.remote, sizeof(G_pcb.remote));
+              printf("[SRTP] Received close_req, sent close_ack.\n");
+              G_pcb.state = handle_state_transition(G_pcb.state, SRTP_TYPE_close_ack);
+            }
+            break;
+
+          case SRTP_TYPE_close_ack:
+            // we got an ack for our close_req, or a final ack after our ack
+            printf("[SRTP] Received close_ack.\n");
+            G_pcb.state = handle_state_transition(G_pcb.state, SRTP_TYPE_close_ack);
+            break;
+
+          default:
+            // ignore anything else
+            continue;
+        }
     }
 
-    if (recv_packet.header.packet_type != SRTP_TYPE_close_req) {
-        printf("[SRTP] Unexpected packet type 0x%x (expected close_ack).\n", recv_packet.header.packet_type);
-        return SRTP_ERROR_protocol;
-    }
-
-    printf("[SRTP] Received close_req.\n");
-    Srtp_Packet_t close_ack;
-    memset(&close_ack, 0, sizeof(close_ack));
-    close_ack.header.packet_type = SRTP_TYPE_close_ack;
-    close_ack.header.seq_num = G_pcb.seq_tx;
-    close_ack.header.ack_num = G_pcb.seq_rx;
-    close_ack.header.payload_len = 0;
-    close_ack.header.checksum = 0;
-        if (sendto(sd, &close_ack, sizeof(Srtp_Header_t), 0,
-               (struct sockaddr*)&G_pcb.remote, sizeof(G_pcb.remote)) < 0) {
-        perror("sendto close_req");
-        return SRTP_ERROR;
-    }
-
-
-    // 4. Transition state to closing_r
-    G_pcb.state = handle_state_transition(G_pcb.state, SRTP_TYPE_close_ack);
-    Srtp_Packet_t recv_packet2;
-    memset(&recv_packet2, 0, sizeof(recv_packet2));
-
-    ssize_t n2 = recv(sd, &recv_packet2, sizeof(recv_packet2), 0);
-    if (n2 < 0) {
-        perror("recv close_ack2222");
-        return SRTP_ERROR;
-    }
-
-    if (recv_packet2.header.packet_type != SRTP_TYPE_close_ack) {
-        printf("[SRTP] Unexpected packet type 0x%x (expected close_ack).\n", recv_packet2.header.packet_type);
-        return SRTP_ERROR_protocol;
-    }
-
-    // 5. Transition to closed
-    G_pcb.state = handle_state_transition(G_pcb.state, SRTP_TYPE_close_ack);
-    G_pcb.finish_time = srtp_timestamp();
-
-
-    // 6. Close socket
+    // 5) fully closed → tear down
     if (close(sd) < 0) {
-        perror("close socket");
+        perror("close");
         return SRTP_ERROR;
     }
-
-    printf("[SRTP] Socket closed successfully.\n");
+    printf("[SRTP] Socket closed, state=CLOSED.\n");
     return SRTP_SUCCESS;
 }
